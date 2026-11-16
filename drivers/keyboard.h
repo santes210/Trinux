@@ -1,0 +1,48 @@
+#ifndef DRIVERS_KEYBOARD_H
+#define DRIVERS_KEYBOARD_H
+
+#include "../lib/types.h"
+
+/* Special key codes returned by keyboard_getchar() (outside ASCII). */
+#define KEY_UP        0x80
+#define KEY_DOWN      0x81
+#define KEY_LEFT      0x82
+#define KEY_RIGHT     0x83
+#define KEY_F1        0x84
+#define KEY_F2        0x85
+#define KEY_F3        0x86
+#define KEY_F4        0x87
+#define KEY_F5        0x88
+#define KEY_F6        0x89
+#define KEY_F7        0x8A
+#define KEY_F8        0x8B
+#define KEY_F9        0x8C
+#define KEY_F10       0x8D
+#define KEY_F11       0x8E
+#define KEY_F12       0x8F
+#define KEY_HOME      0x90
+#define KEY_END       0x91
+#define KEY_DELETE    0x92
+#define KEY_ESC       0x1B
+
+void keyboard_init(void);
+int  keyboard_getchar(void);                       /* blocking; returns key */
+int  keyboard_trygetchar(void);                    /* non-blocking; -1 if none */
+int  keyboard_readline(char *buffer, int max_len); /* returns length */
+int  keyboard_try_getchar(void);   /* non-blocking; -1 if no key in queue */
+void keyboard_reset_modifiers(void);               /* force-reset shift/ctrl/alt */
+void keyboard_reset_all(void);                     /* also clears caps_lock */
+
+/* Inject one fully-decoded key (ASCII char or KEY_* code) into the keyboard
+ * input queue, as if the user had typed it on the PS/2 keyboard. Used by
+ * the serial-input driver so paste-into-COM1 works everywhere. */
+void keyboard_inject_char(int key);
+
+/* Stdin override: when set, keyboard_getchar() reads from this buffer instead
+ * of the keyboard. Used for stdin redirection (< file). The buffer is
+ * consumed character by character; when exhausted, reads fall back to the
+ * keyboard. Pass NULL to clear the override. */
+void keyboard_set_stdin_override(const char *buf, uint32_t len);
+void keyboard_clear_stdin_override(void);
+
+#endif /* DRIVERS_KEYBOARD_H */

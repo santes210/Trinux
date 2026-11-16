@@ -1,0 +1,1330 @@
+#include "syscall.h"
+#include "uaccess.h"
+#include "idt.h"
+#include "../drivers/vga.h"
+#include "../drivers/serial.h"
+#include "../drivers/keyboard.h"
+#include "../drivers/timer.h"
+#include "ports.h"
+#include "../mm/kheap.h"
+#include "../process/process.h"
+#include "../process/scheduler.h"
+#include "../lib/printf.h"
+#include "../lib/string.h"
+#include "../fs/vfs.h"
+#include "../fs/diskfs.h"
+#include "../shell/shell.h"
+#include "../auth/users.h"
+#include "../kernel/elf.h"
+#include "../mm/pmm.h"
+#include "../fs/blockfs.h"
+#include "../drivers/rtc.h"
+#include "../drivers/acpi_ec.h"
+#include "../shell/tcc.h"
+#include "../fs/pipe.h"
+#include "../mm/fork.h"
+#include "../mm/vmm.h"
+
+extern void syscall_stub(void);
+extern void enter_usermode(uint32_t entry, uint32_t user_stack);
+extern void tss_set_kernel_stack(uint32_t esp0);
+
+static bool g_in_usermode;        /* unused now but kept for sig */
+
+/* ---- ELF exit jump buffer ----
+ * (Misma maquinaria que antes; ver elf_jmp.asm para el setjmp/longjmp.) */
+typedef struct {
+    uint32_t valid;
+    uint32_t esp, ebp, ebx, esi, edi, eip;
+    int      exit_code;
+} elf_jmp_t;
+
+static elf_jmp_t g_elf_jmp;
+
+extern int  elf_jmp_setjmp (elf_jmp_t *dst);
+extern void elf_jmp_longjmp(elf_jmp_t *src) __attribute__((noreturn));
+
+void elf_arm_exit_jmp(void)
+{
+    g_elf_jmp.valid = 0;
+    if (elf_jmp_setjmp(&g_elf_jmp) == 0)
+        g_elf_jmp.valid = 1;
+}
+
+int elf_get_exit_code(void) { return g_elf_jmp.exit_code; }
+
+void elf_disarm_exit_jmp(void) { g_elf_jmp.valid = 0; }
+
+bool usermode_fault_kill(int signal_code)
+{
+    process_exit(signal_code);
+    if (g_elf_jmp.valid) {
+        g_elf_jmp.exit_code = signal_code;
+        g_elf_jmp.valid     = 0;
+        elf_jmp_longjmp(&g_elf_jmp);
+    }
+    schedule();
+    return true;
+}
+
+void syscall_install(void)
+{
+    idt_set_gate(0x80, (uint32_t)syscall_stub, 0x08, 0xEE);
+}
+
+/* ---------------- helpers privados ---------------- */
+
+static shell_state_t *S(void) { return shell_get_state(); }
+
+static vfs_node_t *cwd_of_caller(void)
+{
+    shell_state_t *s = S();
+    return s ? s->cwd : vfs_get_root();
+}
+
+static int is_root_user(void)
+{
+    user_t *u = current_user();
+    return (u && u->uid == 0) ? 1 : 0;
+}
+
+/* Mini "handle table" para opendir/readdir/closedir.
+ * Sin fd-table por proceso todavía, así que es global cooperativa. */
+#define DH_MAX 32
+static vfs_node_t *dh_table[DH_MAX];
+static uint32_t    dh_idx[DH_MAX];   /* índice del siguiente readdir */
+
+/* === fd-table simple, global por ahora ===
+ *
+ * Cada fd es {nodo VFS, posición actual, flags}.  Como aún no tenemos
+ * fd-table por proceso, los descriptores se comparten entre todos los
+ * programas ring-3.  El shell ring-3 los usa secuencialmente (open, read,
+ * close) sin solaparse con otros procesos, así que es suficiente.
+ *
+ * fds 0/1/2 (stdin/stdout/stderr) son "virtuales": read en 0 -> teclado,
+ * write en 1/2 -> VGA + serial.  Esos no consumen slot.
+ */
+#define FD_MAX 64
+/* Límite superior del heap de userland gestionado por SYS_BRK (v0.5.2):
+ * debe quedar por debajo de la región más baja usada como stack de
+ * usuario (ver USER_STACK_TOP_* en kernel/elf.c), con margen de sobra. */
+#define BRK_MAX_ADDR 0x0E000000U
+typedef struct {
+    vfs_node_t *node;
+    uint32_t    pos;
+    int         flags;
+    int         used;
+    uint32_t    owner_pid;    /* CRITICAL: track which process owns this fd */
+} kfd_t;
+static kfd_t kfds[FD_MAX];
+
+static int alloc_fd(void) {
+    process_t *cur = process_get_current();
+    uint32_t pid = cur ? cur->pid : 0;
+    for (int i = 3; i < FD_MAX; i++) {   /* 0/1/2 reservados */
+        if (!kfds[i].used) {
+            kfds[i].owner_pid = pid;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* CRITICAL: Clean up all file descriptors owned by a dying process.
+ * Called from process_exit() to prevent FD leaks that would eventually
+ * exhaust the global fd table and prevent any new files from being opened. */
+void fd_cleanup_process(uint32_t pid)
+{
+    int closed = 0;
+    /* Close regular file descriptors */
+    for (int i = 3; i < FD_MAX; i++) {
+        if (kfds[i].used && kfds[i].owner_pid == pid) {
+            kfds[i].used = 0;
+            kfds[i].node = NULL;
+            kfds[i].owner_pid = 0;
+            closed++;
+        }
+    }
+    /* Close all pipes (they don't track ownership, so close all open ones
+     * when any process dies - this is safe since pipes are transient). */
+    for (int fd = 100; fd < 132; fd++) {
+        if (pipe_is_pipe(fd)) {
+            pipe_close(fd);
+            closed++;
+        }
+    }
+    if (closed > 0) {
+        kprintf("[fd] Cleaned up %d fds for process %d\n", closed, pid);
+    }
+}
+
+/* ---------------- handler ---------------- */
+
+void syscall_handler(registers_t *regs)
+{
+    uint32_t num = regs->eax;
+    uint32_t a1  = regs->ebx;
+    uint32_t a2  = regs->ecx;
+    uint32_t a3  = regs->edx;
+
+    /* CRITICAL: Validate syscall number to prevent out-of-bounds dispatch */
+    if (num > 73) {  /* SYS_EXECVE=73 is now the highest valid syscall */
+        kprintf("[syscall] WARNING: invalid syscall number %u from pid %d\n",
+                num, process_get_current() ? process_get_current()->pid : 0);
+        regs->eax = (uint32_t)-1;
+        return;
+    }
+
+    switch (num) {
+
+    /* ---- proceso ---- */
+    case SYS_EXIT:
+        process_exit((int)a1);
+        if (g_elf_jmp.valid) {
+            g_elf_jmp.exit_code = (int)a1;
+            g_elf_jmp.valid     = 0;
+            elf_jmp_longjmp(&g_elf_jmp);   /* nunca regresa */
+        }
+        schedule();
+        break;
+
+    case SYS_GETPID:
+        regs->eax = process_get_current()->pid;
+        break;
+
+    case SYS_YIELD:
+        schedule();
+        regs->eax = 0;
+        break;
+
+    case SYS_SLEEP:
+        sleep(a1);
+        regs->eax = 0;
+        break;
+
+    case SYS_UPTIME:
+        regs->eax = uptime();
+        break;
+
+    /* ---- io básico ---- */
+    case SYS_WRITE: {
+        const char *buf = (const char *)a2;
+        uint32_t len = a3;
+        /* CAMBIO #2: validar puntero de usuario antes de leer */
+        if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
+        for (uint32_t i = 0; i < len; i++) {
+            vga_putchar(buf[i]);  /* respeta vga_capture_begin internamente */
+            /* Si vga capture está activa, no duplicamos al serial — el
+             * usuario quiere redir a archivo, no inundar el debug serial. */
+            extern int vga_capture_active(void);
+            if (!vga_capture_active())
+                serial_write_char(buf[i]);
+        }
+        regs->eax = len;
+        break;
+    }
+
+    case SYS_GETC:
+        regs->eax = (uint32_t)keyboard_getchar();
+        break;
+
+    case SYS_GETLINE: {
+        char    *buf = (char *)a1;
+        uint32_t max = a2;
+        if (max == 0) { regs->eax = 0; break; }
+        if (!uaccess_ok(buf, max)) { regs->eax = (uint32_t)-14; break; }
+        regs->eax = (uint32_t)keyboard_readline(buf, (int)max);
+        break;
+    }
+
+    case SYS_CLEAR:
+        vga_init();
+        regs->eax = 0;
+        break;
+
+    /* ---- fs: alto nivel ---- */
+    case SYS_READFILE: {
+        const char *path  = (const char *)a1;
+        uint8_t    *buf   = (uint8_t    *)a2;
+        uint32_t    maxsz = a3;
+        /* CAMBIO #2: validar punteros de usuario */
+        if (uaccess_strnlen(path, 512) < 0) { regs->eax = (uint32_t)-14; break; }
+        if (maxsz > 0 && !uaccess_ok(buf, maxsz)) { regs->eax = (uint32_t)-14; break; }
+        vfs_node_t *n = vfs_resolve(path, cwd_of_caller());
+        if (!n || n->type != VFS_FILE) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: sin esto, cualquier proceso sin privilegios podía leer
+         * /etc/shadow (o cualquier archivo 0600 de otro usuario) llamando
+         * a readfile() directo, sin pasar por los checks del shell. */
+        if (!vfs_check_access(n, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
+        uint32_t want = n->size < maxsz ? n->size : maxsz;
+        regs->eax = vfs_read(n, 0, want, buf);
+        break;
+    }
+
+    case SYS_WRITEFILE: {
+        const char *path = (const char *)a1;
+        uint8_t    *buf  = (uint8_t    *)a2;
+        uint32_t    len  = a3;
+        /* CAMBIO #2: validar punteros de usuario */
+        if (uaccess_strnlen(path, 512) < 0) { regs->eax = (uint32_t)-14; break; }
+        if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
+        vfs_node_t *n = vfs_create(path, cwd_of_caller());
+        if (!n) { regs->eax = (uint32_t)-1; break; }
+        n->size = 0;
+        regs->eax = vfs_write(n, 0, len, buf);
+        break;
+    }
+
+    /* ---- fs: directorios ---- */
+    case SYS_GETCWD: {
+        char *buf = (char *)a1; int max = (int)a2;
+        if (max <= 0) { regs->eax = 0; break; }
+        if (!uaccess_ok(buf, (uint32_t)max)) { regs->eax = (uint32_t)-14; break; }
+        char tmp[256];
+        vfs_get_path(cwd_of_caller(), tmp);
+        int n = 0; while (tmp[n] && n < max - 1) { buf[n] = tmp[n]; n++; }
+        buf[n] = '\0';
+        regs->eax = (uint32_t)n;
+        break;
+    }
+
+    case SYS_CHDIR: {
+        const char *p = (const char *)a1;
+        /* CAMBIO #2: validar path de usuario */
+        if (uaccess_strnlen(p, 512) < 0) { regs->eax = (uint32_t)-1; break; }
+        vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
+        if (!n || n->type != VFS_DIRECTORY) { regs->eax = (uint32_t)-1; break; }
+        S()->cwd = n;
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_MKDIR: {
+        const char *p = (const char *)a1;
+        UCHECK_STR(p);
+        regs->eax = vfs_mkdir(p, cwd_of_caller()) ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    case SYS_RMDIR: {
+        const char *p = (const char *)a1;
+        UCHECK_STR(p);
+        vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
+        if (!n || n->type != VFS_DIRECTORY) { regs->eax = (uint32_t)-1; break; }
+        if (n->child_count > 0)              { regs->eax = (uint32_t)-1; break; }
+        regs->eax = vfs_delete(p, cwd_of_caller()) >= 0 ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    case SYS_UNLINK: {
+        const char *p = (const char *)a1;
+        UCHECK_STR(p);
+        regs->eax = vfs_delete(p, cwd_of_caller()) >= 0 ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    case SYS_RENAME: {
+        const char *src = (const char *)a1;
+        const char *dst = (const char *)a2;
+        UCHECK_STR(src);
+        UCHECK_STR(dst);
+        vfs_node_t *sn = vfs_resolve(src, cwd_of_caller());
+        if (!sn) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: leer el contenido de src para copiarlo a dst requiere
+         * permiso de lectura sobre src (antes se podía "rename" un archivo
+         * ajeno y leer su contenido sin ningún check). */
+        if (!vfs_check_access(sn, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
+        /* implementación simple: leer src, escribir dst, borrar src.
+         * No conserva metadata fina, pero suficiente para mv simple. */
+        if (sn->type == VFS_FILE) {
+            uint8_t *tmp = (uint8_t *)kmalloc(sn->size + 1);
+            if (!tmp) { regs->eax = (uint32_t)-1; break; }
+            uint32_t got = vfs_read(sn, 0, sn->size, tmp);
+            vfs_node_t *dn = vfs_create(dst, cwd_of_caller());
+            if (!dn) { kfree(tmp); regs->eax = (uint32_t)-1; break; }
+            dn->size = 0;
+            vfs_write(dn, 0, got, tmp);
+            kfree(tmp);
+            vfs_delete(src, cwd_of_caller());
+            regs->eax = 0;
+        } else {
+            regs->eax = (uint32_t)-1;  /* dirs no soportado todavía */
+        }
+        break;
+    }
+
+    case SYS_OPENDIR: {
+        const char *p = (const char *)a1;
+        UCHECK_STR(p);
+        vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
+        if (!n || n->type != VFS_DIRECTORY) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: listar un directorio requiere permiso de lectura sobre
+         * él (p.ej. /root es 0700: sin este check, un usuario normal podía
+         * hacer opendir("/root")+readdir() y enumerar sus archivos). */
+        if (!vfs_check_access(n, ACC_READ)) { regs->eax = (uint32_t)-1; break; }
+        int slot = -1;
+        for (int i = 1; i < DH_MAX; i++) if (!dh_table[i]) { slot = i; break; }
+        if (slot < 0) { regs->eax = (uint32_t)-1; break; }
+        dh_table[slot] = n;
+        dh_idx[slot] = 0;
+        regs->eax = (uint32_t)slot;
+        break;
+    }
+
+    case SYS_READDIR: {
+        int dh = (int)a1;
+        trinux_dirent_t *de = (trinux_dirent_t *)a2;
+        if (!uaccess_ok(de, sizeof(trinux_dirent_t))) { regs->eax = (uint32_t)-14; break; }
+        if (dh <= 0 || dh >= DH_MAX || !dh_table[dh]) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        vfs_node_t *c = vfs_readdir(dh_table[dh], dh_idx[dh]);
+        if (!c) { regs->eax = (uint32_t)-1; break; }
+        dh_idx[dh]++;
+        int i = 0;
+        while (c->name[i] && i < 63) { de->name[i] = c->name[i]; i++; }
+        de->name[i] = '\0';
+        de->type = c->type;
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_CLOSEDIR: {
+        int dh = (int)a1;
+        if (dh > 0 && dh < DH_MAX) {
+            dh_table[dh] = NULL;
+            dh_idx[dh] = 0;
+        }
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_STAT: {
+        const char *p = (const char *)a1;
+        trinux_stat_t *st = (trinux_stat_t *)a2;
+        UCHECK_STR(p);
+        if (!uaccess_ok(st, sizeof(trinux_stat_t))) { regs->eax = (uint32_t)-14; break; }
+        vfs_node_t *n = vfs_resolve(p, cwd_of_caller());
+        if (!n) { regs->eax = (uint32_t)-1; break; }
+        int i = 0;
+        while (n->name[i] && i < 63) { st->name[i] = n->name[i]; i++; }
+        st->name[i] = '\0';
+        st->size = n->size;
+        st->type = n->type;
+        st->perm = n->permissions;
+        st->uid  = n->owner_uid;
+        st->gid  = n->owner_gid;
+        regs->eax = 0;
+        break;
+    }
+
+    /* ---- sistema / privilegio ---- */
+    case SYS_HOSTNAME: {
+        char *buf = (char *)a1; int max = (int)a2;
+        if (max > 0 && !uaccess_ok(buf, (uint32_t)max)) { regs->eax = (uint32_t)-14; break; }
+        const char *h = S() ? S()->hostname : "trinux";
+        int n = 0;
+        while (h[n] && n < max - 1) { buf[n] = h[n]; n++; }
+        buf[n] = '\0';
+        regs->eax = (uint32_t)n;
+        break;
+    }
+
+    case SYS_GETUID:
+        regs->eax = (uint32_t)(current_user() ? current_user()->uid : 0);
+        break;
+
+    case SYS_GETUSER: {
+        char *buf = (char *)a1; int max = (int)a2;
+        if (max > 0 && !uaccess_ok(buf, (uint32_t)max)) { regs->eax = (uint32_t)-14; break; }
+        const char *u = current_user() ? current_user()->name : "?";
+        int n = 0;
+        while (u[n] && n < max - 1) { buf[n] = u[n]; n++; }
+        buf[n] = '\0';
+        regs->eax = (uint32_t)n;
+        break;
+    }
+
+    case SYS_REBOOT: {
+        if (!is_root_user()) { regs->eax = (uint32_t)-1; break; }
+        kprintf("Rebooting...\n");
+        uint8_t good = 0x02;
+        while (good & 0x02) good = inb(0x64);
+        outb(0x64, 0xFE);
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+        break;
+    }
+
+    case SYS_SHUTDOWN: {
+        if (!is_root_user()) { regs->eax = (uint32_t)-1; break; }
+        kprintf("System halted. It is now safe to power off.\n");
+        outw(0x604, 0x2000);
+        outw(0xB004, 0x2000);
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+        break;
+    }
+
+    case SYS_KILL: {
+        int pid = (int)a1;
+        int sig = (int)a2;
+        if (!is_root_user()) { regs->eax = (uint32_t)-1; break; }
+        if (sig == 0) {
+            /* signal 0: just check if pid exists */
+            regs->eax = process_get((uint32_t)pid) ? 0 : (uint32_t)-1;
+        } else if (sig == SIGKILL || sig == SIGTERM) {
+            /* Fatal signals: terminate immediately */
+            regs->eax = process_kill((uint32_t)pid) >= 0 ? 0 : (uint32_t)-1;
+        } else {
+            /* Other signals: deliver via signal_pending */
+            regs->eax = process_signal((uint32_t)pid, sig) >= 0 ? 0 : (uint32_t)-1;
+        }
+        break;
+    }
+
+    case SYS_SYNC: {
+        int r = diskfs_save();
+        regs->eax = (r >= 0) ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    /* ============================================================
+     * ABI 3.0  -  shell en ring-3
+     * ============================================================ */
+    case SYS_FILE_OPEN: {
+        const char *path = (const char *)a1;
+        int flags = (int)a2;
+        UCHECK_STR(path);
+        vfs_node_t *n = vfs_resolve(path, cwd_of_caller());
+        if (!n && (flags & O_CREAT))
+            n = vfs_create(path, cwd_of_caller());
+        if (!n) { regs->eax = (uint32_t)-1; break; }
+        /* SECURITY: open() con O_RDONLY/O_WRONLY/O_RDWR debe respetar los
+         * permisos rwx del nodo, igual que readfile()/writefile(). Sin esto
+         * SYS_FILE_OPEN + SYS_FILE_READ era una vía alterna para leer
+         * archivos ajenos (p.ej. /etc/shadow) sin pasar por ningún check. */
+        int acc_mode = flags & 0x3;   /* O_RDONLY=0, O_WRONLY=1, O_RDWR=2 */
+        if (acc_mode == O_RDONLY && !vfs_check_access(n, ACC_READ)) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        if ((acc_mode == O_WRONLY || acc_mode == O_RDWR) &&
+            !vfs_check_access(n, ACC_WRITE)) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        int fd = alloc_fd();
+        if (fd < 0) { regs->eax = (uint32_t)-1; break; }
+        kfds[fd].node = n;
+        kfds[fd].pos = (flags & O_APPEND) ? n->size : 0;
+        if (flags & O_TRUNC) n->size = 0;
+        kfds[fd].flags = flags;
+        kfds[fd].used = 1;
+        regs->eax = (uint32_t)fd;
+        break;
+    }
+
+    case SYS_FILE_READ: {
+        int fd = (int)a1;
+        if (fd == 0) {
+            char *b = (char *)a2;
+            int len = (int)a3;
+            if (!uaccess_ok(b, (uint32_t)len)) { regs->eax = (uint32_t)-14; break; }
+            regs->eax = (uint32_t)keyboard_readline(b, len);
+            break;
+        }
+        /* Pipe read: check if fd is a pipe before checking kfds */
+        if (pipe_is_pipe(fd)) {
+            uint32_t len = a3;
+            if (!uaccess_ok((void *)a2, len)) { regs->eax = (uint32_t)-14; break; }
+            int got = pipe_read(fd, (void *)a2, len);
+            regs->eax = (uint32_t)got;
+            break;
+        }
+        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        kfd_t *k = &kfds[fd];
+        if (k->pos >= k->node->size) { regs->eax = 0; break; }
+        uint32_t want = a3;
+        if (!uaccess_ok((void *)a2, want)) { regs->eax = (uint32_t)-14; break; }
+        if (k->pos + want > k->node->size) want = k->node->size - k->pos;
+        uint32_t got = vfs_read(k->node, k->pos, want, (uint8_t *)a2);
+        k->pos += got;
+        regs->eax = got;
+        break;
+    }
+
+    case SYS_FILE_WRITE: {
+        int fd = (int)a1;
+        const char *buf = (const char *)a2;
+        uint32_t len = a3;
+        if (len > 0 && !uaccess_ok(buf, len)) { regs->eax = (uint32_t)-14; break; }
+        if (fd == 1 || fd == 2) {
+            for (uint32_t i = 0; i < len; i++) {
+                vga_putchar(buf[i]);
+                serial_write_char(buf[i]);
+            }
+            regs->eax = len;
+            break;
+        }
+        /* Pipe write: check if fd is a pipe before checking kfds */
+        if (pipe_is_pipe(fd)) {
+            int wrote = pipe_write(fd, buf, len);
+            if (wrote < 0) {
+                /* Broken pipe: deliver SIGPIPE to current process */
+                process_t *p = process_get_current();
+                if (p) {
+                    p->signal_pending = SIGPIPE;
+                }
+            }
+            regs->eax = (uint32_t)wrote;
+            break;
+        }
+        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        kfd_t *k = &kfds[fd];
+        uint32_t wrote = vfs_write(k->node, k->pos, len, (uint8_t *)buf);
+        k->pos += wrote;
+        regs->eax = wrote;
+        break;
+    }
+
+    case SYS_FILE_CLOSE: {
+        int fd = (int)a1;
+        if (pipe_is_pipe(fd)) {
+            pipe_close(fd);
+        } else if (fd >= 3 && fd < FD_MAX) {
+            kfds[fd].used = 0;
+        }
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_FILE_SEEK: {
+        int fd = (int)a1;
+        int off = (int)a2;
+        int whence = (int)a3;
+        if (fd < 3 || fd >= FD_MAX || !kfds[fd].used) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        kfd_t *k = &kfds[fd];
+        uint32_t newpos = k->pos;
+        if (whence == SEEK_SET) newpos = (uint32_t)off;
+        else if (whence == SEEK_CUR) newpos = k->pos + off;
+        else if (whence == SEEK_END) newpos = k->node->size + off;
+        k->pos = newpos;
+        regs->eax = newpos;
+        break;
+    }
+
+    case SYS_KEY_RAW: {
+        int k = keyboard_getchar();
+        /* Traducimos los códigos kernel-internos a los KEY_F_* públicos
+         * para que la ABI no dependa del enum del driver. */
+        switch (k) {
+            case KEY_UP:    k = KEY_F_UP;    break;
+            case KEY_DOWN:  k = KEY_F_DOWN;  break;
+            case KEY_LEFT:  k = KEY_F_LEFT;  break;
+            case KEY_RIGHT: k = KEY_F_RIGHT; break;
+            case KEY_HOME:  k = KEY_F_HOME;  break;
+            case KEY_END:   k = KEY_F_END;   break;
+            default: break;
+        }
+        regs->eax = (uint32_t)k;
+        break;
+    }
+
+    case SYS_VGA_COLOR: {
+        /* vga_entry_color es static inline en vga.h; lo replicamos: byte =
+         * (bg << 4) | fg, ambos en 0..15. */
+        uint8_t color = (uint8_t)(((a2 & 0x0F) << 4) | (a1 & 0x0F));
+        vga_set_color(color);
+        regs->eax = 0;
+        break;
+    }
+
+    /* === SPAWN: lanza un ELF en ring-3 (sincrónicamente con WAIT) === */
+    case SYS_SPAWN: {
+        const char *path = (const char *)a1;
+        char **argv = (char **)a2;
+        uint32_t flags = a3;
+        (void)flags;  /* hoy siempre WAIT */
+        UCHECK_STR(path);
+        /* Copia local de path por la misma razón que SPAWN_R */
+        static char k_path2[128];
+        int i=0; while (path[i] && i<127){ k_path2[i]=path[i]; i++; } k_path2[i]=0;
+        int argc = 0;
+        if (argv) while (argv[argc]) argc++;
+        int rc = elf_exec_argv(k_path2, cwd_of_caller(), argc, argv);
+        regs->eax = (uint32_t)rc;
+        break;
+    }
+
+    case SYS_WAITPID: {
+        /* waitpid real: bloquea hasta que un hijo termine */
+        int pid = (int)a1;
+        int *status = (int *)a2;
+        int options = (int)a3;
+        if (status && !uaccess_ok(status, sizeof(int))) {
+            regs->eax = (uint32_t)-14;
+            break;
+        }
+        regs->eax = (uint32_t)process_waitpid(pid, status, options);
+        break;
+    }
+
+    case SYS_SPAWN_R: {
+        spawn_req_t *r = (spawn_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(spawn_req_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!r || !r->path) { regs->eax = (uint32_t)-1; break; }
+        int argc = 0;
+        if (r->argv) while (r->argv[argc]) argc++;
+
+        /* COPIAMOS los punteros y campos críticos a memoria local del kernel
+         * porque la memoria del shell padre se RESPALDA y se restaura
+         * durante elf_exec_argv() — pero también se PISA por el ELF hijo
+         * que vive en el mismo VA 0x08048000.  El backup conserva el código
+         * binario; las strings de r-> viven en stack/scratch del shell y
+         * SÍ se pisan transitoriamente, así que las leemos antes. */
+        static char k_path[128];
+        static char k_outpath[128];
+        static char k_inpath[128];
+        int   has_out = (r->stdout_path != NULL);
+        int   has_in  = (r->stdin_path != NULL);
+        int   append  = r->append;
+        const char *src;
+        src = r->path;
+        { int i=0; while (src[i] && i<127){ k_path[i]=src[i]; i++; } k_path[i]=0; }
+        if (has_out) {
+            src = r->stdout_path;
+            int i=0; while (src[i] && i<127){ k_outpath[i]=src[i]; i++; } k_outpath[i]=0;
+        }
+        if (has_in) {
+            src = r->stdin_path;
+            int i=0; while (src[i] && i<127){ k_inpath[i]=src[i]; i++; } k_inpath[i]=0;
+        }
+
+        char **argv_user = r->argv;   /* elf_exec_argv copia argv en kheap
+                                         si g_nest >= 1, así que está OK */
+
+        /* Stdin redirection: read file into buffer and set keyboard override */
+        static uint8_t stdin_buf[4096];
+        uint32_t stdin_len = 0;
+        if (has_in) {
+            vfs_node_t *fin = vfs_resolve(k_inpath, cwd_of_caller());
+            if (fin && fin->type == VFS_FILE) {
+                stdin_len = fin->size < sizeof(stdin_buf) ? fin->size : sizeof(stdin_buf);
+                vfs_read(fin, 0, stdin_len, stdin_buf);
+                keyboard_set_stdin_override((const char *)stdin_buf, stdin_len);
+            }
+        }
+
+        if (has_out) {
+            static char cap[16384];
+            vga_capture_begin(cap, sizeof(cap));
+            int rc = elf_exec_argv(k_path, cwd_of_caller(), argc, argv_user);
+            uint32_t n = vga_capture_end();
+            vfs_node_t *f = vfs_create(k_outpath, cwd_of_caller());
+            if (f) {
+                if (append) {
+                    vfs_write(f, f->size, n, (uint8_t *)cap);
+                } else {
+                    f->size = 0;
+                    vfs_write(f, 0, n, (uint8_t *)cap);
+                }
+            }
+            regs->eax = (uint32_t)rc;
+        } else {
+            int rc = elf_exec_argv(k_path, cwd_of_caller(), argc, argv_user);
+            regs->eax = (uint32_t)rc;
+        }
+
+        /* Clear stdin override after spawn completes */
+        if (has_in) {
+            keyboard_clear_stdin_override();
+        }
+        break;
+    }
+
+    case SYS_USERADD: {
+        if (!is_root_user()) { regs->eax = (uint32_t)-1; break; }
+        useradd_req_t *r = (useradd_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(useradd_req_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!r) { regs->eax = (uint32_t)-1; break; }
+        user_t *u = users_add(r->name, r->pass, r->uid, r->gid, r->home);
+        regs->eax = u ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    case SYS_PASSWD: {
+        passwd_req_t *r = (passwd_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(passwd_req_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!r) { regs->eax = (uint32_t)-1; break; }
+        /* sólo root puede cambiar passwords de otros; un usuario sólo
+         * puede cambiar el suyo. */
+        user_t *me = current_user();
+        if (!me) { regs->eax = (uint32_t)-1; break; }
+        if (me->uid != 0 && strcmp(me->name, r->user) != 0) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        regs->eax = users_set_password(r->user, r->new_pass) ? 0 : (uint32_t)-1;
+        break;
+    }
+
+    case SYS_LOGIN: {
+        const char *u = (const char *)a1;
+        const char *p = (const char *)a2;
+        UCHECK_STR(u);
+        UCHECK_STR(p);
+        user_t *uu = users_find(u);
+        if (!uu || !users_check_password(u, p)) { regs->eax = (uint32_t)-1; break; }
+        set_current_user(uu);
+        /* sincronizar el cwd del shell con el home del usuario */
+        vfs_node_t *home = vfs_resolve(uu->home, vfs_get_root());
+        if (home && S()) S()->cwd = home;
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_LISTPROC: {
+        plist_req_t *r = (plist_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(plist_req_t))) { regs->eax = 0; break; }
+        if (!r || !r->list || r->max <= 0) { regs->eax = 0; break; }
+        int n = 0;
+        for (uint32_t i = 0; i < process_count() && n < r->max; i++) {
+            process_t *p = process_at(i);
+            if (!p) continue;
+            r->list[n].pid = p->pid;
+            for (int k = 0; k < 31 && p->name[k]; k++) r->list[n].name[k] = p->name[k];
+            r->list[n].name[31] = 0;
+            r->list[n].cpu_ticks = p->cpu_ticks;
+            r->list[n].state     = (uint32_t)p->state;
+            r->list[n].priority  = p->priority;
+            n++;
+        }
+        r->got = n;
+        regs->eax = (uint32_t)n;
+        break;
+    }
+
+    /* ============================================================
+     * ABI 3.1 - finalizing all coreutils on ring 3
+     * ============================================================ */
+    case SYS_CHMOD: {
+        const char *p = (const char *)a1;
+        UCHECK_STR(p);
+        regs->eax = vfs_chmod(p, cwd_of_caller(), a2) >= 0 ? 0 : (uint32_t)-1;
+        break;
+    }
+    case SYS_CHOWN: {
+        const char *p = (const char *)a1;
+        if (!is_root_user()) { regs->eax = (uint32_t)-1; break; }
+        UCHECK_STR(p);
+        regs->eax = vfs_chown(p, cwd_of_caller(), a2, a3) >= 0 ? 0 : (uint32_t)-1;
+        break;
+    }
+    case SYS_MEMINFO: {
+        mem_info_t *m = (mem_info_t *)a1;
+        if (!uaccess_ok(m, sizeof(mem_info_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!m) { regs->eax = (uint32_t)-1; break; }
+        m->total_bytes = pmm_get_total_memory();
+        m->used_bytes  = pmm_get_used_memory();
+        m->free_bytes  = pmm_get_free_memory();
+        regs->eax = 0;
+        break;
+    }
+    case SYS_DFINFO: {
+        df_info_t *d = (df_info_t *)a1;
+        if (!uaccess_ok(d, sizeof(df_info_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!d) { regs->eax = (uint32_t)-1; break; }
+        d->have_disk = blockfs_available() ? 1 : 0;
+        d->block_size = BLOCK_SIZE;
+        if (d->have_disk) {
+            d->total_blocks = blockfs_total_blocks();
+            d->used_blocks  = blockfs_used_blocks();
+        } else {
+            d->total_blocks = 0;
+            d->used_blocks  = 0;
+        }
+        regs->eax = 0;
+        break;
+    }
+    case SYS_DATETIME: {
+        datetime_u_t *t = (datetime_u_t *)a1;
+        if (!uaccess_ok(t, sizeof(datetime_u_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!t) { regs->eax = (uint32_t)-1; break; }
+        datetime_t dt;
+        rtc_read_datetime(&dt);
+        t->year = dt.year; t->month = dt.month; t->day = dt.day;
+        t->hour = dt.hour; t->minute = dt.minute; t->second = dt.second;
+        regs->eax = 0;
+        break;
+    }
+    case SYS_USERLIST: {
+        user_list_req_t *r = (user_list_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(user_list_req_t))) { regs->eax = 0; break; }
+        if (!r || !r->list || r->max <= 0) { regs->eax = 0; break; }
+        int n = 0;
+        int nu = users_count();
+        for (int i = 0; i < nu && n < r->max; i++) {
+            user_t *u = users_at(i);
+            if (!u) continue;
+            int k=0; while (u->name[k] && k<31){ r->list[n].name[k]=u->name[k]; k++; }
+            r->list[n].name[k]=0;
+            r->list[n].uid = u->uid;
+            r->list[n].gid = u->gid;
+            k=0; while (u->home[k] && k<63){ r->list[n].home[k]=u->home[k]; k++; }
+            r->list[n].home[k]=0;
+            n++;
+        }
+        r->got = n;
+        regs->eax = (uint32_t)n;
+        break;
+    }
+    case SYS_RENICE: {
+        int pid = (int)a1, prio = (int)a2;
+        regs->eax = process_set_priority((uint32_t)pid, prio) >= 0 ? 0 : (uint32_t)-1;
+        break;
+    }
+    case SYS_BATTERY: {
+        battery_u_t *b = (battery_u_t *)a1;
+        if (!uaccess_ok(b, sizeof(battery_u_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!b) { regs->eax = (uint32_t)-1; break; }
+        battery_info_t info;
+        if (!acpi_ec_read_battery(&info) || !info.present) {
+            b->present = 0; b->percent = 0; b->discharging = 0; b->time_minutes = -1;
+            regs->eax = (uint32_t)-1; break;
+        }
+        b->present = 1;
+        b->percent = (int)info.percentage;
+        b->discharging = info.discharging ? 1 : 0;
+        b->time_minutes = -1;
+        regs->eax = 0;
+        break;
+    }
+    case SYS_LOGOUT: {
+        set_current_user(NULL);
+        regs->eax = 0;
+        break;
+    }
+    case SYS_SU: {
+        const char *u = (const char *)a1;
+        const char *p = (const char *)a2;
+        UCHECK_STR(u);
+        UCHECK_STR(p);
+        user_t *uu = users_find(u);
+        if (!uu) { regs->eax = (uint32_t)-1; break; }
+        /* root no necesita password */
+        if (!is_root_user() && !users_check_password(u, p)) {
+            regs->eax = (uint32_t)-1; break;
+        }
+        set_current_user(uu);
+        regs->eax = 0;
+        break;
+    }
+    case SYS_GETGROUPS: {
+        groups_req_t *r = (groups_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(groups_req_t))) { regs->eax = 0; break; }
+        if (!r || !r->list || r->max <= 0) { regs->eax = 0; break; }
+        user_t *u = current_user();
+        if (!u) { r->got = 0; regs->eax = 0; break; }
+        r->list[0].uid = u->uid;
+        r->list[0].gid = u->gid;
+        r->got = 1;
+        regs->eax = 1;
+        break;
+    }
+    case SYS_VFS_FIND: {
+        find_req_t *r = (find_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(find_req_t))) { regs->eax = 0; break; }
+        if (!r || !r->out_paths || r->max <= 0) { regs->eax = 0; break; }
+        vfs_node_t *root = vfs_resolve(r->root_path ? r->root_path : "/", cwd_of_caller());
+        if (!root) { r->got = 0; regs->eax = 0; break; }
+        /* Recursive find, BFS sencilla */
+        typedef struct { vfs_node_t *n; char path[256]; } stk_t;
+        static stk_t stk[256];
+        int sp = 0;
+        stk[sp].n = root;
+        char rp[256]; vfs_get_path(root, rp);
+        int rl = 0; while (rp[rl] && rl<255){ stk[sp].path[rl]=rp[rl]; rl++; }
+        stk[sp].path[rl] = 0;
+        sp++;
+        int got = 0;
+        const char *needle = r->name_substr;
+        while (sp > 0 && got < r->max) {
+            sp--;
+            vfs_node_t *n = stk[sp].n;
+            char cur[256];
+            int cl = 0; while (stk[sp].path[cl] && cl<255){ cur[cl]=stk[sp].path[cl]; cl++; }
+            cur[cl] = 0;
+            /* check name */
+            if (needle) {
+                int match = 0;
+                for (int i = 0; n->name[i]; i++) {
+                    int j = 0;
+                    while (needle[j] && n->name[i+j] == needle[j]) j++;
+                    if (!needle[j]) { match = 1; break; }
+                }
+                if (match) {
+                    int k=0; while (cur[k] && k<255){ r->out_paths[got][k]=cur[k]; k++; }
+                    r->out_paths[got][k]=0;
+                    got++;
+                }
+            } else {
+                int k=0; while (cur[k] && k<255){ r->out_paths[got][k]=cur[k]; k++; }
+                r->out_paths[got][k]=0;
+                got++;
+            }
+            if (n->type == VFS_DIRECTORY) {
+                for (uint32_t i = 0; sp < 256; i++) {
+                    vfs_node_t *c = vfs_readdir(n, i);
+                    if (!c) break;
+                    stk[sp].n = c;
+                    int p = 0;
+                    while (cur[p] && p<200){ stk[sp].path[p]=cur[p]; p++; }
+                    if (p == 0 || stk[sp].path[p-1] != '/') stk[sp].path[p++] = '/';
+                    int q = 0;
+                    while (c->name[q] && p<255){ stk[sp].path[p++]=c->name[q++]; }
+                    stk[sp].path[p] = 0;
+                    sp++;
+                }
+            }
+        }
+        r->got = got;
+        regs->eax = (uint32_t)got;
+        break;
+    }
+    case SYS_VFS_TREE: {
+        /* Imprime el árbol del root_path via vga_putchar (recursión limitada). */
+        tree_req_t *r = (tree_req_t *)a1;
+        if (!uaccess_ok(r, sizeof(tree_req_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!r) { regs->eax = (uint32_t)-1; break; }
+        vfs_node_t *root = vfs_resolve(r->root_path ? r->root_path : "/", cwd_of_caller());
+        if (!root) { regs->eax = (uint32_t)-1; break; }
+        /* iterativo DFS */
+        typedef struct { vfs_node_t *n; int depth; } it_t;
+        static it_t st[256];
+        int sp = 0;
+        st[sp].n = root; st[sp].depth = 0; sp++;
+        int max_d = r->max_depth > 0 ? r->max_depth : 32;
+        while (sp > 0) {
+            sp--;
+            vfs_node_t *n = st[sp].n;
+            int d = st[sp].depth;
+            for (int i = 0; i < d; i++) { vga_putchar(' '); vga_putchar(' '); }
+            for (int i = 0; n->name[i]; i++) vga_putchar(n->name[i]);
+            if (n->type == VFS_DIRECTORY) vga_putchar('/');
+            vga_putchar('\n');
+            if (n->type == VFS_DIRECTORY && d < max_d) {
+                /* push children en orden inverso para mantener orden DFS */
+                int count = 0;
+                for (uint32_t i = 0; ; i++) { if (!vfs_readdir(n, i)) break; count++; }
+                for (int i = count - 1; i >= 0 && sp < 256; i--) {
+                    st[sp].n = vfs_readdir(n, (uint32_t)i);
+                    st[sp].depth = d + 1;
+                    sp++;
+                }
+            }
+        }
+        regs->eax = 0;
+        break;
+    }
+    case SYS_RESOLVE: {
+        const char *path = (const char *)a1;
+        char *out = (char *)a2;
+        int max = (int)a3;
+        UCHECK_STR(path);
+        if (!out || max <= 0) { regs->eax = (uint32_t)-1; break; }
+        if (!uaccess_ok(out, (uint32_t)max)) { regs->eax = (uint32_t)-14; break; }
+        vfs_node_t *n = vfs_resolve(path, cwd_of_caller());
+        if (!n) { regs->eax = (uint32_t)-1; break; }
+        char tmp[256]; vfs_get_path(n, tmp);
+        int i = 0; while (tmp[i] && i < max-1){ out[i]=tmp[i]; i++; }
+        out[i] = 0;
+        regs->eax = (uint32_t)i;
+        break;
+    }
+
+    /* ---- ABI extra para top/edit/tcc (Fase 5) ---- */
+    case SYS_KEY_POLL: {
+        int k = keyboard_try_getchar();
+        if (k >= 0) {
+            switch (k) {
+                case KEY_UP:    k = KEY_F_UP;    break;
+                case KEY_DOWN:  k = KEY_F_DOWN;  break;
+                case KEY_LEFT:  k = KEY_F_LEFT;  break;
+                case KEY_RIGHT: k = KEY_F_RIGHT; break;
+                case KEY_HOME:  k = KEY_F_HOME;  break;
+                case KEY_END:   k = KEY_F_END;   break;
+                default: break;
+            }
+        }
+        regs->eax = (uint32_t)k;
+        break;
+    }
+
+    case SYS_VGA_GOTO: {
+        extern void vga_set_cursor(int x, int y);
+        vga_set_cursor((int)a1, (int)a2);
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_VGA_CLEAR: {
+        extern void vga_clear(void);
+        vga_clear();
+        extern void vga_set_cursor(int x, int y);
+        vga_set_cursor(0, 0);
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_TCC_COMPILE: {
+        const char *src = (const char *)a1;
+        UCHECK_STR(src);
+        if (!src) { regs->eax = (uint32_t)-1; break; }
+        /* Copia local del path porque puede vivir en memoria del shell
+         * que se respalda durante operaciones internas. */
+        static char k_src[128]; static char k_out[128];
+        int i = 0; while (src[i] && i < 127){ k_src[i] = src[i]; i++; } k_src[i] = 0;
+        /* derivar nombre de salida: quitar ".c" si existe */
+        int j = 0; while (k_src[j] && j < 127){ k_out[j] = k_src[j]; j++; } k_out[j] = 0;
+        if (j > 2 && k_out[j-2] == '.' && k_out[j-1] == 'c') k_out[j-2] = 0;
+        regs->eax = (uint32_t)tcc_compile(k_src, k_out);
+        break;
+    }
+
+    case SYS_SMP_INFO: {
+        extern int      smp_cpu_count(void);
+        extern uint32_t smp_lapic_base(void);
+        extern uint8_t  smp_bsp_apic_id(void);
+        /* Need a cpu accessor — declared in cpu/smp.h, ya hay extern arriba */
+        extern struct smp_cpu_t *smp_cpu_at(int i);
+        typedef struct {
+            uint8_t  apic_id;
+            uint8_t  acpi_id;
+            bool     enabled;
+            bool     online;
+        } smp_cpu_local_t;
+        extern smp_cpu_local_t *smp_cpu_at_raw(int i);
+
+        smp_info_t *out = (smp_info_t *)a1;
+        if (!uaccess_ok(out, sizeof(smp_info_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!out) { regs->eax = (uint32_t)-1; break; }
+        int n = smp_cpu_count();
+        out->n_cpus = n;
+        out->online = 1;  /* hoy solo el BSP corre */
+        out->lapic_base = smp_lapic_base();
+        out->bsp_apic_id = smp_bsp_apic_id();
+        for (int i = 0; i < n && i < 8; i++) {
+            /* smp_cpu_at devuelve smp_cpu_t*; usamos misma estructura */
+            extern uint8_t smp_get_apic_id_at(int i);
+            out->apic_ids[i] = smp_get_apic_id_at(i);
+        }
+        regs->eax = 0;
+        break;
+    }
+
+    case SYS_FB_INFO: {
+        /* Devuelve info del display activo: framebuffer si modo grafico,
+         * texto VGA si fallback. Util para diagnostico en hardware real. */
+        extern bool display_using_fb(void);
+        extern int  display_text_cols(void);
+        extern int  display_text_rows(void);
+        extern int  fb_pixel_width(void);
+        extern int  fb_pixel_height(void);
+        /* Para acceder a addr/pitch/bpp tendríamos que exponerlos desde fb.c.
+         * Lo hacemos via funciones helper. */
+        extern uint32_t fb_get_addr(void);
+        extern uint32_t fb_get_pitch(void);
+        extern int      fb_get_bpp(void);
+
+        fb_info_t *out = (fb_info_t *)a1;
+        if (!uaccess_ok(out, sizeof(fb_info_t))) { regs->eax = (uint32_t)-14; break; }
+        if (!out) { regs->eax = (uint32_t)-1; break; }
+        if (display_using_fb()) {
+            out->active   = 1;
+            out->fb_addr  = fb_get_addr();
+            out->pitch    = fb_get_pitch();
+            out->width    = fb_pixel_width();
+            out->height   = fb_pixel_height();
+            out->bpp      = fb_get_bpp();
+        } else {
+            out->active   = 0;
+            out->fb_addr  = 0;
+            out->pitch    = 0;
+            out->width    = 0;
+            out->height   = 0;
+            out->bpp      = 0;
+        }
+        out->text_cols = display_text_cols();
+        out->text_rows = display_text_rows();
+        regs->eax = 0;
+        break;
+    }
+
+
+    /* ---- CAMBIO #3: pipes en memoria ---- */
+    case SYS_PIPE: {
+        /* ecx = puntero a int[2] donde se escriben los fds */
+        int *fds = (int *)a2;
+        if (!uaccess_ok(fds, sizeof(int) * 2)) { regs->eax = (uint32_t)-14; break; }
+        regs->eax = (uint32_t)pipe_create(fds);
+        break;
+    }
+
+    case SYS_PIPE_CLOSE: {
+        pipe_close((int)a1);
+        regs->eax = 0;
+        break;
+    }
+
+    /* ---- fork/getppid (v0.3.1) ---- */
+    case SYS_FORK: {
+        int child_pid = process_fork();
+        regs->eax = (uint32_t)child_pid;
+        break;
+    }
+
+    case SYS_GETPPID: {
+        process_t *p = process_get_current();
+        regs->eax = p ? p->parent_pid : 0;
+        break;
+    }
+
+    case SYS_SIGNAL: {
+        int sig = (int)a1;
+        void (*handler)(int) = (void (*)(int))a2;
+        void (*old)(int) = process_sigaction(sig, handler);
+        regs->eax = (uint32_t)old;
+        break;
+    }
+
+    case SYS_BRK: {
+        /* brk() real por proceso (v0.5.2). ebx = nueva dirección de break
+         * (0 = solo consultar el break actual). Devuelve el break ANTERIOR
+         * (semántica estilo Unix: el valor de retorno de brk() malo suele
+         * ser -1, pero esta ABI histórica de Trinux usa 0 == error y por
+         * eso lo conservamos así). El heap crece desde justo después del
+         * BSS del ELF (proc->heap_start, calculado en kernel/elf.c al
+         * cargar el programa) y NUNCA puede bajar de ahí.
+         *
+         * Antes: la dirección base era un placeholder fijo (0x08100000)
+         * compartido por TODOS los procesos sin importar dónde terminaba
+         * realmente su BSS -- para binarios más grandes que ~1 MB de
+         * code+data+bss esto habría solapado el heap con el propio
+         * código/datos del programa. Ahora cada proceso trackea su
+         * propio heap_start/heap_brk. */
+        process_t *p = process_get_current();
+        if (!p || !p->page_dir) {
+            regs->eax = 0;
+            break;
+        }
+        if (p->heap_start == 0) {
+            /* Proceso sin ELF cargado (no debería llegar aquí desde
+             * userland real, pero por seguridad no dejamos crecer un
+             * heap sin base conocida). */
+            regs->eax = 0;
+            break;
+        }
+        /* Límite superior: debe quedar por debajo de la región más baja
+         * que puede usarse como stack de usuario (ver USER_STACK_TOP_*
+         * en kernel/elf.c), con margen de sobra para no colisionar. */
+        uint32_t new_brk = a1;
+        if (new_brk == 0) {
+            regs->eax = p->heap_brk;
+            break;
+        }
+        if (new_brk < p->heap_start || new_brk >= BRK_MAX_ADDR) {
+            regs->eax = 0;  /* fuera de rango: no se toca heap_brk */
+            break;
+        }
+        uint32_t old_brk = p->heap_brk;
+        if (new_brk > old_brk) {
+            /* Crecer: mapear las páginas nuevas necesarias. */
+            uint32_t start_pg = (old_brk + 0xFFF) & ~0xFFFu;
+            uint32_t end_pg   = (new_brk + 0xFFF) & ~0xFFFu;
+            for (uint32_t pg = start_pg; pg < end_pg; pg += 0x1000) {
+                uint32_t flags = PAGE_PRESENT | PAGE_RW | PAGE_USER;
+                vmm_map_page_in(p->page_dir, pg, pg, flags);
+            }
+        }
+        /* Encoger (new_brk < old_brk): no desmapeamos páginas por ahora
+         * (evita liberar frames físicos compartidos con el identity-map
+         * global); simplemente el proceso ya no puede *pedir* más break
+         * por debajo de heap_start. Esto es conservador pero seguro. */
+        p->heap_brk = new_brk;
+        regs->eax = old_brk;
+        break;
+    }
+
+    /* === SYS_EXECVE: execve() real -- reemplaza la imagen del proceso
+     * QUE HACE LA LLAMADA (mismo pid) en vez de crear un proceso nuevo,
+     * a diferencia de SYS_SPAWN que crea uno nuevo y espera al que
+     * termine. Éxito: parcheamos regs->eip/regs->useresp del propio
+     * trap frame de este int 0x80 -- cuando este handler retorne, el
+     * `iret` de syscall_asm.asm saltará directo al programa nuevo. El
+     * proceso que llamó nunca "regresa" del syscall en el sentido
+     * normal, tal como pasa con execve(2) en Unix real. Fallo: el
+     * proceso llamador sigue corriendo con SU imagen intacta. */
+    case SYS_EXECVE: {
+        const char *path = (const char *)a1;
+        char **argv = (char **)a2;
+        UCHECK_STR(path);
+        static char k_path3[128];
+        int i = 0; while (path[i] && i < 127) { k_path3[i] = path[i]; i++; } k_path3[i] = 0;
+        int argc = 0;
+        if (argv) while (argv[argc]) argc++;
+        uint32_t new_eip = 0, new_esp = 0;
+        int rc = elf_execve(k_path3, cwd_of_caller(), argc, argv, &new_eip, &new_esp);
+        if (rc == 0) {
+            regs->eip     = new_eip;
+            regs->useresp = new_esp;
+            /* eax no importa: el programa nuevo arranca en _start, no
+             * en el punto donde alguien esperaba el valor de retorno
+             * de un syscall -- igual que un execve() real. */
+        } else {
+            regs->eax = (uint32_t)rc;
+        }
+        break;
+    }
+
+        default:
+        kprintf("\n[syscall] unknown syscall %u\n", num);
+        regs->eax = (uint32_t)-1;
+        break;
+    }
+
+    /* Check for pending signals before returning to usermode.
+     * If a signal was delivered (e.g., Ctrl-C), terminate the process. */
+    if (process_check_signal()) {
+        /* Process was killed by signal. Force exit via longjmp. */
+        if (g_elf_jmp.valid) {
+            process_t *p = process_get_current();
+            g_elf_jmp.exit_code = p ? p->exit_code : 128 + SIGINT;
+            g_elf_jmp.valid = 0;
+            elf_jmp_longjmp(&g_elf_jmp);
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+
+static void usermode_trampoline(void) {
+    process_t* p = process_get_current();
+    uint8_t *ustack = (uint8_t *)kmalloc_aligned(8192);
+    uint32_t user_stack_top = (uint32_t)(ustack + 8192) & ~0xF;
+
+    enter_usermode((uint32_t)p->entry, user_stack_top);
+    /* nunca regresa */
+}
+
+int usermode_run(const char *name, void (*entry)(void))
+{
+    process_t *p = process_create(name, usermode_trampoline);
+    if (!p) return -1;
+    p->entry = entry;
+    scheduler_add(p);
+    return p->pid;
+}
