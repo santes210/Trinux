@@ -72,7 +72,6 @@ jobs:
             xorriso \
             mtools \
             dosfstools \
-            truncate \
             file \
             coreutils
           echo "── Versiones instaladas ──"
